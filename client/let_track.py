@@ -91,6 +91,25 @@ def resolve_default_git_username() -> Optional[str]:
     return None
 
 
+
+def wake_up_render_server(url: str, max_wait: int = 65) -> bool:
+    """Despierta el contenedor de Render antes de iniciar el handshake WebSocket."""
+    if not ("onrender.com" in url or "render" in url):
+        return True
+    print("⏳ Conectando con el servidor del curso (si estaba en reposo, tomará ~45s)...")
+    start = time.time()
+    import urllib.request
+    while time.time() - start < max_wait:
+        try:
+            with urllib.request.urlopen(f"{url}/", timeout=10) as response:
+                if response.status < 500:
+                    print("✅ Servidor activo. Estableciendo canal en tiempo real...")
+                    return True
+        except Exception:
+            time.sleep(3)
+    return False
+
+
 class StudentTrackerClient:
     def __init__(
         self,
@@ -106,8 +125,9 @@ class StudentTrackerClient:
 
         self.sio = socketio.Client(
             reconnection=True,
-            reconnection_attempts=30,
+            reconnection_attempts=0,  # 0 = reintentos ilimitados ante reinicios/cortes
             reconnection_delay=2,
+            reconnection_delay_max=10,
         )
 
         self.repo_root = DynamicPathResolver.find_repo_root()
@@ -154,7 +174,24 @@ class StudentTrackerClient:
         )
         self._git_watcher_thread.start()
 
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_worker,
+            daemon=True,
+            name="WebSocketHeartbeatThread",
+        )
+        self._heartbeat_thread.start()
+
         self._setup_socket_handlers()
+
+    def _heartbeat_worker(self) -> None:
+        """Envía un pulso ligero cada 4 minutos para mantener despierto el contenedor en Render."""
+        while self._worker_running:
+            time.sleep(240)
+            if self.sio.connected:
+                try:
+                    self.sio.emit("ping_alive", {"student": self.student_id})
+                except Exception:
+                    pass
 
     def _discover_local_avatar(self) -> tuple[Optional[str], Optional[bytes]]:
         for ext in (".png", ".jpg", ".jpeg", ".webp"):
@@ -192,6 +229,16 @@ class StudentTrackerClient:
                     print(f"[*] Foto de perfil local '{h[:6]}' sincronizada con exito.")
                 except Exception as exc:
                     print(f"[!] No se pudo subir el avatar al servidor: {exc}")
+
+        @self.sio.on("mission_updated")
+        def on_mission_updated(data):
+            mission = data.get("mission") if isinstance(data, dict) else None
+            if mission and mission.get("active"):
+                print(f"\n[🎯 MISIÓN ACTIVA]: {mission.get('title')} ({mission.get('points')} pts) [{mission.get('rule_type')}: {mission.get('pattern')}]")
+            elif mission and not mission.get("active"):
+                print(f"\n[⏸️ MISIÓN PAUSADA]: {mission.get('title')} (congelada temporalmente)")
+            else:
+                print(f"\n[⏹️ ESPERANDO MISIÓN]: El docente no ha iniciado ninguna misión activa.")
 
         @self.sio.event
         def disconnect():
@@ -397,6 +444,7 @@ class StudentTrackerClient:
         print("[*] Salir            : Presiona Ctrl+C en esta terminal para finalizar")
         print("=" * 65)
         print("[*] Conectando al servidor...")
+        wake_up_render_server(self.server_url)
 
         try:
             self.sio.connect(self.server_url, wait_timeout=5)
